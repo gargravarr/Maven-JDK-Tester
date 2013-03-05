@@ -5,11 +5,15 @@
 import argparse
 import logging
 import os
-import subprocess
+import os.path
+import shutil
 import re
+import subprocess
+import tempfile
+import uuid
 import xml.etree.ElementTree as ET
 
-import lxml
+import lxml.etree
 
 NAMESPACE = 'http://maven.apache.org/POM/4.0.0'
 NAMESPACES = { 'mvn' : NAMESPACE }
@@ -42,6 +46,23 @@ def get_pom_paths(path=os.getcwd()):
             pom_paths.append(root)
 
     return pom_paths
+
+
+def configure_compiler(pom_file, jdk_version):
+    compiler_xpath = "//mvn:project/mvn:build/mvn:plugins/mvn:plugin/mvn:artifactId"
+    maven_compiler_plugin = """
+        <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-compiler-plugin</artifactId>
+            <configuration>
+                <source>""" + jdk_version + """</source>
+                <target>""" + jdk_version + """</target>
+            </configuration>
+        </plugin>
+        """
+
+    pom_tree = lxml.etree.parse(pom_file)
+    print lxml.etree.tostring(pom_tree)
 
 def find_artifacts_by_group(group_id, project_path):
     command = ['mvn', 'dependency:tree']
@@ -202,9 +223,17 @@ if __name__ == '__main__':
         logging.error(error_message)
         exit()
 
+    # Work on a local copy
+    work_dir = os.path.join(tempfile.gettempdir(), str(uuid.uuid4()))
+    shutil.copytree(args.target_dir, work_dir)
+
     # Build list of projects. This is not the perfect solution, because the real deal should be checking which of those
     # are Super POMs, and then preparing the build. More on that later...
-    projects = get_pom_paths(args.target_dir)
+    projects = get_pom_paths(work_dir)
+
+
+    # Cleanup used resources
+    shutil.rmtree(work_dir)
     exit()
 
     header = '{| class="wikitable sortable"\n' + '|-\n' + '! Group\n' + '! Name\n' + '! Organization/Team\n' \
