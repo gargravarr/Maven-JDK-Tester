@@ -38,7 +38,7 @@ def configure_logging(quiet=None):
     logging.basicConfig(level=level, format='%(levelname)-6s %(message)s')
 
 
-def get_pom_paths(path=os.getcwd()):
+def get_project_paths(path=os.getcwd()):
     pom_paths = []
 
     for root, dirs, files in os.walk(path):
@@ -229,7 +229,7 @@ if __name__ == '__main__':
 
     # Build list of projects. This is not the perfect solution, because the real deal should be checking which of those
     # are Super POMs, and then preparing the build. More on that later...
-    projects = get_pom_paths(work_dir)
+    projects = get_project_paths(work_dir)
 
 
     # Cleanup used resources
