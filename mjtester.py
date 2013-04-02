@@ -4,16 +4,23 @@
 
 import argparse
 import logging
+import json
 import os
 import os.path
-import shutil
 import re
+import shutil
 import subprocess
 import tempfile
+import urllib2
 import uuid
 import xml.etree.ElementTree as ET
 
 import lxml.etree
+
+# Globals
+DRY_RUN = False
+WORK_DIR = os.getcwd()
+MAVEN_REPOSITORY = 'http://search.maven.org'
 
 NAMESPACE = 'http://maven.apache.org/POM/4.0.0'
 NAMESPACES = { 'mvn' : NAMESPACE }
@@ -21,9 +28,12 @@ NS_PREFIX = '{' + NAMESPACE + '}'
 
 
 def process_arguments():
-    parser = argparse.ArgumentParser(description='Maven artifact tester')
-    parser.add_argument('-dir', '--target-dir', metavar='URI', help='target directory', default=os.getcwd())
+    parser = argparse.ArgumentParser(description='Maven version tester')
+    parser.add_argument('-dir', '--target-dir', metavar='URI', help='target directory', default=WORK_DIR)
     parser.add_argument('-jdk', '--target-jdk', metavar='JDK', nargs='?', help='target JDK version')
+    parser.add_argument('-mvn', '--target-mvn', metavar='MVN', nargs='?', help='target Maven version')
+    parser.add_argument('-art', '--artifact', metavar='ART', nargs='*', 
+                        help='Maven artifact to set version, in the form groupId:artifactId:version')
     parser.add_argument('-q', '--quiet', action='store_true', help='be silent, only log warnings and errors')
     parser.add_argument('--dry-run', action='store_true', help='only do a dry run and output what would be executed')
 
@@ -31,6 +41,10 @@ def process_arguments():
 
 
 def configure_logging(quiet=None):
+    """Configures logging environment.
+
+    Defaults to DEBUG.
+    """
     if quiet:
         level = logging.WARNING
     else:
@@ -39,14 +53,18 @@ def configure_logging(quiet=None):
 
 
 def get_project_paths(path=os.getcwd()):
+    """Returns a list of paths with Maven projects.
+
+    For the given path, searches recursively for valid Maven projects and returns a list with their locations.
+    """
     pom_paths = []
 
+    # Search for pom.xml files
     for root, dirs, files in os.walk(path):
         if 'pom.xml' in files:
             pom_paths.append(root)
 
     return pom_paths
-
 
 def configure_compiler(pom_file, jdk_version):
     compiler_xpath = "//mvn:project/mvn:build/mvn:plugins/mvn:plugin/mvn:artifactId"
@@ -64,41 +82,6 @@ def configure_compiler(pom_file, jdk_version):
     pom_tree = lxml.etree.parse(pom_file)
     print lxml.etree.tostring(pom_tree)
 
-def find_artifacts_by_group(group_id, project_path):
-    command = ['mvn', 'dependency:tree']
-    matcher = re.compile("\[INFO\]([\|\+\-\\\ ]+)([\w\.-]+):(.*?):")
-    savedir = os.getcwd()
-    artifact_set = set()
-
-    os.chdir(project_path)
-    pipe = subprocess.Popen(command, stdout=subprocess.PIPE)
-
-    # Enable searching for dependencies
-    artifact_offset = -1
-
-    for line in pipe.stdout:
-        match = matcher.match(line)
-        if match:
-            offset, match_group_id, artifact_id = match.group(1), match.group(2), match.group(3)
-            logging.debug("%s: Matching result - Offset: (%s), Group Id: (%s), Artifact Id: (%s)",
-                project_path, offset, match_group_id, artifact_id)
-            if artifact_offset == -1 or len(offset) <= artifact_offset:
-                # Re-enable dependency search
-                artifact_offset = -1
-
-                if match_group_id == group_id:
-                    logging.info("%s: Found artifact - Artifact Id: (%s)", project_path, artifact_id)
-                    artifact_set.add(artifact_id)
-                    # Disable search for inner dependencies
-                    artifact_offset = len(offset)
-
-    # Go back to where we were
-    os.chdir(savedir)
-
-    if len(artifact_set) == 0:
-        return None
-    else:
-        return artifact_set
 
 def update_artifacts_version(pom_file, group_id, artifact_set, version):
     # XPath queries
@@ -193,7 +176,12 @@ def mvn_clean_install(path):
         return False
 
 # Checks for the correct versions in the build environment
-def check_versions(jdk_version=None, mvn_version=None):
+def verify_version_mismatches(jdk_version=None, mvn_version=None):
+    """Checks mismatches between environment and specified versions.
+
+    Verifies if the Java and Maven versions in the current environment match the specified arguments. If there is any
+    version mismatch, returns an error message describing the issue. If everything matches, nothing is returned.
+    """
     matchers = { re.compile('Java version: (\S*)') : jdk_version,
                  re.compile('Apache Maven (\S*)') : mvn_version }
 
@@ -201,113 +189,215 @@ def check_versions(jdk_version=None, mvn_version=None):
 
     for line in pipe.stdout:
         for matcher in matchers.keys():
+            # This will only apply matchers to versions that are set
             if matchers[ matcher ]:
+                # I know I'm chomping the hell out of it, but I just can't resist!
+                # Yes, caught by the Dark Side (Ugh! Perl :P)
+                error_message = 'Version mismatch. System has {}; given version was {}'.format(line.rstrip('\n'), matchers[ matcher ])
+
+                version_length = len(matchers[matcher])
+
+                # Versions must be at least 3 characters wide - e.g 1.7, 2.2
+                if version_length < 3:
+                    return error_message
+
                 match = matcher.match(line)
-                if match and matchers[ matcher ] not in match.group(1):
-                    # I know I'm chomping the hell out of it, but I just can't resist!
-                    # Yes, caught by the Dark Side (Perl :P)
-                    return '{} - version mismatch: {}'.format(line.rstrip('\n'), matchers[ matcher ])
+                if match:
+                    # Tune version_length to the least common denominator
+                    if len(match.group(1)) < version_length:
+                        version_length = len(match.group(1))
 
-    return None
+                    # Now for the actual match!
+                    if matchers[matcher][0:version_length] != match.group(1)[0:version_length]:
+                        return error_message
 
-if __name__ == '__main__':
+
+def check_artifact(group_id, artifact_id, version, maven_repository=MAVEN_REPOSITORY):
+    """Returns True if the specified artifact exists.
+
+    Queries the central repository for the specified artifact. Returns True if exists, false otherwise. Other
+    repository can be specified, to search for local artifacts.
+    """
+
+    # Query string
+    query = '/solrsearch/select?q=g:"' + group_id + '"+AND+a:"' + artifact_id + '"+AND+v:"' + version + '"'
+
+    # Get JSON info from repository
+    f = urllib2.urlopen(maven_repository + query)
+    result = json.loads(f.read())
+    if result['response']['numFound'] != 1:
+        return False
+
+    return True
+
+
+def check_dependencies(project_path, artifact_list):
+    """Checks which artifacts in the specified list are present in the project dependency tree.
+
+    Verifies if any artifact in the specified list is present in the project's dependency tree. Returns a list with the
+    ones that are present. If no one is, returns None.
+
+    Each artifact in the list must be represented by a dictionary with the keys 'artifactId', 'groupId' and 'version'
+    set.
+    """
+    command = ['mvn', 'dependency:tree']
+    artifacts_by_string = {}
+    dependencies_found = []
+
+    # Build a matcher for each artifact
+    for artifact in artifact_list:
+        match_string = artifact['groupId'] + ":" + artifact['artifactId'] + ":jar:"
+        artifacts_by_string[match_string] = artifact
+
+    # Save current directory
+    savedir = os.getcwd()
+
+    os.chdir(project_path)
+    pipe = subprocess.Popen(command, stdout=subprocess.PIPE)
+
+    # Scan each dependency, line by line
+    for artifact_string in artifacts_by_string.keys():
+        for line in pipe.stdout:
+            if artifact_string in line:
+                # Add to found dependencies
+                dependencies_found.append(artifacts_by_string[artifact_string])
+                break
+
+    # Go back to where we were
+    os.chdir(savedir)
+
+    if len(dependencies_found) == 0:
+        return None
+    return dependencies_found
+
+def update_dependencies_version(project_path, dependency_list):
+    """Updates the specified dependencies' versions in the POM of the specified project.
+    """
+
+    # XPath Queries
+    artifact_id_query = '/mvn:artifactId[text()="{}"]/..'
+    version_query = 'mvn:version'
+
+    dependency_query = '//mvn:project/mvn:dependencies/mvn:dependency' + artifact_id_query
+    dependencyMgmt_query = '//mvn:project/mvn:dependencyManagement/mvn:dependencies/mvn:dependency'  + artifact_id_query
+
+    # Save current directory
+    savedir = os.getcwd()
+    os.chdir(project_path)
+
+    # Load POM
+    pom_tree = lxml.etree.parse('pom.xml')
+
+    for dependency in dependency_list:
+        query = dependency_query.format(dependency['artifactId'])
+        found_nodes = pom_tree.xpath(query, namespaces=NAMESPACES)
+        print "Found {} nodes ".format(len(found_nodes))
+
+
+    #print lxml.etree.tostring(pom_tree)
+
+    # Go back to where we were
+    os.chdir(savedir)
+
+def main():
+    global DRY_RUN, WORK_DIR
 
     # Process arguments
     args = process_arguments()
     DRY_RUN = args.dry_run
     configure_logging(args.quiet)
 
+    # Validate target directory
+    if not os.path.isdir(args.target_dir):
+        logging.error("Invalid target directory: %s", args.target_dir)
+        exit()
+    # Set working directory
+    WORK_DIR = args.target_dir
+
     # Validate Versions
-    error_message = check_versions(args.target_jdk)
+    error_message = verify_version_mismatches(jdk_version=args.target_jdk, mvn_version=args.target_mvn)
     if error_message:
         logging.error(error_message)
         exit()
 
-    # Work on a local copy
-    work_dir = os.path.join(tempfile.gettempdir(), str(uuid.uuid4()))
-    shutil.copytree(args.target_dir, work_dir)
+    # Validate and construct list of artifacts
+    artifact_list = []
+    if args.artifact:
+        for raw_artifact in args.artifact:
+            items = raw_artifact.split(':')
+            if len(items) != 3:
+                logging.error("Artifact %s is not in the expected format - groupId:artifactId:version.", raw_artifact)
+                exit()
+
+            # Treat each item by its name
+            group_id, artifact_id, version = items[0], items[1], items[2]
+
+            logging.info("Checking artifact %s.", raw_artifact)
+            if check_artifact(group_id, artifact_id, version):
+                # Append validated artifact to the list
+                artifact = {'groupId' : group_id, 'artifactId' : artifact_id, 'version' : version }
+
+                logging.debug("Appending %s to artifact list.", artifact)
+                artifact_list.append(artifact)
+            else:
+                logging.error("Artifact %s not found.", raw_artifact)
+                exit()
+
+    # From here on, we're good to go!
+
+    # Work on a temp copy
+    if not DRY_RUN:
+        WORK_DIR = os.path.join(tempfile.gettempdir(), str(uuid.uuid4()))
+        logging.debug("Copying %s to temp dir...", args.target_dir)
+        # Copy all, except 'target' directories
+        shutil.copytree(args.target_dir, WORK_DIR, ignore=shutil.ignore_patterns("target"))
+
+    logging.debug("Working on %s", WORK_DIR)
 
     # Build list of projects. This is not the perfect solution, because the real deal should be checking which of those
     # are Super POMs, and then preparing the build. More on that later...
-    projects = get_project_paths(work_dir)
+    projects = get_project_paths(WORK_DIR)
 
+    logging.info("Scanning for projects...")
+    # If no projects were found, return
+    if len(projects) == 0:
+        logging.error("No projects found at %s", args.target_dir)
+        return
+    logging.info("Found %s projects.", len(projects))
 
-    # Cleanup used resources
-    shutil.rmtree(work_dir)
-    exit()
+    # Check which projects use given artifacts
+    if artifact_list:
+        logging.info("Checking dependencies...")
+        dependencies_by_project = {}
+        for project in projects:
+            # For each project, check which are in use
+            dependencies_in_use = check_dependencies(project, artifact_list)
 
-    header = '{| class="wikitable sortable"\n' + '|-\n' + '! Group\n' + '! Name\n' + '! Organization/Team\n' \
-        + '! Build Result\n' + '! Reason\n' + '! Solvable\n'
+            # If dependencies are found, update versions in pom
+            if dependencies_in_use:
+                logging.debug("Project %s uses %s", project, dependencies_in_use)
+                logging.debug("Updating dependencies for %s", project)
+                if not DRY_RUN:
+                    update_dependencies_version(project, dependencies_in_use)
 
-    footer = '|}\n'
-    report = header
-
-    project_types = ['maven-jar', 'maven-maven-plugin', 'maven-pom', 'maven-war']
-
-    current_dir = os.getcwd()
-
-    parser = argparse.ArgumentParser(description='Project compiler tool')
-    parser.add_argument('-dir', '--target-dir', metavar='DIR', nargs='?', help='target directory', default=current_dir)
-    parser.add_argument('-jdk', '--target-jdk', metavar='JDK', nargs='?', help='target JDK version')
-    parser.add_argument('-cxf', '--target-cxf', metavar='CXF', nargs='?', help='target Apache CXF version')
-    parser.add_argument('-mvn', '--target-mvn', metavar='MVN', nargs='?', help='target Maven version')
-    parser.add_argument('-out', '--out-file', metavar='OUT', nargs='?', help='report output file')
-
-    args = parser.parse_args()
-
-    if args.quiet:
-        level = logging.WARNING
-    else:
-        level = logging.DEBUG
-
-    logging.basicConfig(level=level, format='%(levelname)-6s %(message)s')
-
-
-    for project_type in project_types:
-        subprocess.call([
-            'python',
-            'checkout.py',
-            '--flatten',
-            '-f',
-            'type=' + project_type,
-            args.target_dir,
-        ])
-
-    os.chdir(args.target_dir)
-    projects = os.listdir(args.target_dir)
-
-    # For debugging only
-    # projects = projects[:5]
-    numprojects = len(projects)
-
-    for project in projects:
-        print '{} projects remaining...'.format(numprojects)
-        print 'Building ' + project + '...'
-#        logging.info('sdfsdf %s', 234)
-
-        project_pom = project + '/pom.xml'
-        if os.path.isdir(project) and os.path.isfile(project_pom):
-            # Configure build parameters
-            update_pom(project_pom, jdk=args.target_jdk)
-
-            build_result = mvn_clean_install(project)
-            if build_result:
-                print project + ': BUILD SUCCESSFUL'
+                dependencies_by_project[project] = dependencies_in_use
             else:
-                print project + ': BUILD FAILURE'
+                logging.debug("No dependency found for %s", project)
 
-            project_report = build_project_report(project_pom, build_result)
-            report += project_report
-        else:
-            print project + ': not a Maven project.'
-        numprojects = numprojects - 1
+        if len(dependencies_by_project) == 0:
+            logging.error("No project use the specified dependencies: %s", args.artifact)
+            return
 
-    report += footer
+        # Update project list
+        projects = dependencies_by_project.keys()
 
-    os.chdir(current_dir)
+    logging.info("%s projects are eligible to build.", len(projects))
 
-    if args.out_file:
-        with open(args.out_file, 'w') as f:
-            f.write(report)
-    else:
-        print report
+
+if __name__ == '__main__':
+    main()
+    # Cleanup used resources
+    if not DRY_RUN:
+        logging.debug("Removing %s", WORK_DIR)
+        shutil.rmtree(WORK_DIR)
+    exit()
