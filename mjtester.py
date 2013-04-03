@@ -270,34 +270,117 @@ def check_dependencies(project_path, artifact_list):
         return None
     return dependencies_found
 
-def update_dependencies_version(project_path, dependency_list):
-    """Updates the specified dependencies' versions in the POM of the specified project.
+def update_dependencies_version(pom_tree, dependency_list):
+    """Updates the specified dependencies' versions in the specified project POM.
+
+    Changes the project's POM, so that the specified dependencies are set to the specified versions. To accomplish this,
+    versions are configured in the <dependencyManagement> section. To avoid overrides, versions declared in the
+    <dependencies> section of the POM are removed.
+    """
+
+    # XML Tags
+    dependencies_tag = """    <dependencies>
+            </dependencies>"""
+
+    dependencymgmt_tag = """
+        <dependencyManagement>
+        """ + dependencies_tag + """
+        </dependencyManagement>
+    """
+
+    version_template = """<version>{}</version>"""
+
+    dependency_template = """
+        <dependency>
+            <groupId>{}</groupId>
+            <artifactId>{}</artifactId>
+            """ + version_template + """
+        </dependency>
     """
 
     # XPath Queries
-    artifact_id_query = '/mvn:artifactId[text()="{}"]/..'
-    version_query = 'mvn:version'
+    project_xpath = '//mvn:project'
+    artifact_suffix = '/mvn:artifactId[text()="{}"]/../mvn:groupId[text()="{}"]/..'
+    version_suffix = 'mvn:version'
 
-    dependency_query = '//mvn:project/mvn:dependencies/mvn:dependency' + artifact_id_query
-    dependencyMgmt_query = '//mvn:project/mvn:dependencyManagement/mvn:dependencies/mvn:dependency'  + artifact_id_query
+    dependencymgmt_xpath = project_xpath + '/mvn:dependencyManagement'
+    dependencies_xpath = dependencymgmt_xpath + '/mvn:dependencies'
 
-    # Save current directory
-    savedir = os.getcwd()
-    os.chdir(project_path)
+    dependencies_query = project_xpath + '/mvn:dependencies/mvn:dependency' + artifact_suffix
+    dependencymgmt_query = dependencies_xpath + '/mvn:dependency' + artifact_suffix
 
-    # Load POM
-    pom_tree = lxml.etree.parse('pom.xml')
-
+    # Remove <version> below <dependency> section.
     for dependency in dependency_list:
-        query = dependency_query.format(dependency['artifactId'])
-        found_nodes = pom_tree.xpath(query, namespaces=NAMESPACES)
-        print "Found {} nodes ".format(len(found_nodes))
 
+        # Check if there are versions declared at the <dependency> section.
+        query = dependencies_query.format(dependency['artifactId'], dependency['groupId'])
 
-    #print lxml.etree.tostring(pom_tree)
+        # This supposedly should find one and only one artifact. If it founds another, well let it be. We're not here to
+        # fix POMs anyway :P
+        artifacts_found = pom_tree.xpath(query, namespaces=NAMESPACES)
 
-    # Go back to where we were
-    os.chdir(savedir)
+        for artifact in artifacts_found:
+            # Query for version tags
+            artifact_version = artifact.xpath(version_suffix, namespaces=NAMESPACES)
+
+            # Remove version node. Versions are handled in <dependencyManagement>
+            for av in artifact_version:
+                artifact.remove(av)
+
+    # Construct <dependencyManagement> in the least invasive way. Boring! ...but needed
+    # Should project_node be checked as well?
+    project_node = pom_tree.xpath(project_xpath, namespaces=NAMESPACES)
+    dependencymgmt_node = pom_tree.xpath(dependencymgmt_xpath, namespaces=NAMESPACES)
+    dependencies_node = pom_tree.xpath(dependencies_xpath, namespaces=NAMESPACES)
+
+    if len(dependencymgmt_node) == 0:
+        dependencymgmt_node = lxml.etree.fromstring(dependencymgmt_tag)
+        project_node[0].append(lxml.etree.fromstring(dependencymgmt_tag))
+    else:
+        # We're only interested in the node, not in the resulting list
+        dependencymgmt_node = dependencymgmt_node[0]
+
+        if len(dependencies_node) == 0:
+            dependencies_node = lxml.etree.fromstring(dependencies_tag)
+            dependencymgmt_node.append(dependencies_node)
+        else:
+            # We're only interested in the node, not in the resulting list
+            dependencies_node = dependencies_node[0]
+
+    # Update artifact versions
+    for dependency in dependency_list:
+        # Check if there are versions declared at the <dependency> section.
+        query = dependencymgmt_query.format(dependency['artifactId'], dependency['groupId'])
+
+        # This supposedly should find one and only one artifact. If it founds another, well let it be. We're not here to
+        # fix POMs anyway :P
+        artifacts_found = pom_tree.xpath(query, namespaces=NAMESPACES)
+
+        if len(artifacts_found) == 0:
+            # Not found, insert brand new
+            dependency_tag = dependency_template.format(
+                dependency['artifactId'], 
+                dependency['groupId'], 
+                dependency['version'])
+            dependencies_node.append(lxml.etree.fromstring(dependency_tag))
+        else:
+            # Found, update version
+            # Query for version tag
+            for artifact in artifacts_found:
+                # Query for version tags
+                artifact_version = artifact.xpath(version_suffix, namespaces=NAMESPACES)
+
+                if len(artifact_version) == 0:
+                    # Not found, insert it
+                    version_tag = version_template.format(dependency['version'])
+                    artifact.append(lxml.etree.fromstring(version_tag))
+                else:
+                    # Update version node. Versions are handled in <dependencyManagement>
+                    for av in artifact_version:
+                        av.text = dependency['version']
+
+    return pom_tree
+
 
 def main():
     global DRY_RUN, WORK_DIR
@@ -376,9 +459,17 @@ def main():
             # If dependencies are found, update versions in pom
             if dependencies_in_use:
                 logging.debug("Project %s uses %s", project, dependencies_in_use)
+
                 logging.debug("Updating dependencies for %s", project)
+                project_pom = os.path.join(project, 'pom.xml')
+
+                # Get XML tree and update it
+                pom_tree = lxml.etree.parse(project_pom)
+                pom_tree = update_dependencies_version(pom_tree, dependencies_in_use)
+
                 if not DRY_RUN:
-                    update_dependencies_version(project, dependencies_in_use)
+                    logging.debug("Writing updated POM for %s", project)
+                    pom_tree.write(project_pom)
 
                 dependencies_by_project[project] = dependencies_in_use
             else:
