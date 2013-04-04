@@ -162,20 +162,6 @@ def build_project_report(project_pom, build_result):
 '''
 
 
-def mvn_clean_install(path):
-    savedir = os.getcwd()
-
-    os.chdir(path)
-    pipe = subprocess.Popen(['mvn', 'clean', 'install'], stdout=subprocess.PIPE)
-    result = pipe.stdout.read()
-
-    os.chdir(savedir)
-    if re.search('BUILD SUCCESSF', result) != None:
-        return True
-    else:
-        return False
-
-# Checks for the correct versions in the build environment
 def verify_version_mismatches(jdk_version=None, mvn_version=None):
     """Checks mismatches between environment and specified versions.
 
@@ -382,6 +368,25 @@ def update_dependencies_version(pom_tree, dependency_list):
     return pom_tree
 
 
+def mvn_clean_install(project_path):
+    """Build the project in the specified project path.
+
+    Executes a 'mvn clean install' in the specified project path. If it is not successful, returns the output generated
+    by Maven.
+    """
+
+    # Will be set if errors happen
+    maven_output = None
+
+    # Execute mvn clean install on project's directory
+    pipe = subprocess.Popen(['mvn', 'clean', 'install'], stdout=subprocess.PIPE, cwd=project_path)
+    exit_code = pipe.returncode
+
+    if return_code != 0:
+        maven_output = pipe.stdout.read()
+
+    return maven_output
+
 def main():
     global DRY_RUN, WORK_DIR
 
@@ -460,12 +465,12 @@ def main():
             if dependencies_in_use:
                 logging.debug("Project %s uses %s", project, dependencies_in_use)
 
-                logging.debug("Updating dependencies for %s", project)
                 project_pom = os.path.join(project, 'pom.xml')
 
                 # Get XML tree and update it
                 pom_tree = lxml.etree.parse(project_pom)
                 pom_tree = update_dependencies_version(pom_tree, dependencies_in_use)
+                logging.debug("Updated dependencies for %s", project)
 
                 if not DRY_RUN:
                     logging.debug("Writing updated POM for %s", project)
@@ -483,6 +488,22 @@ def main():
         projects = dependencies_by_project.keys()
 
     logging.info("%s projects are eligible to build.", len(projects))
+
+    # Build every project
+    num_projects = len(projects)
+    logging.info("Building projects.")
+
+    for project in projects:
+        logging.info("%s projects remaining. Building %s ...", num_projects, project)
+
+        if not DRY_RUN:
+            error_output = mvn_clean_install(project)
+            if error_output:
+                logging.info("%s: FAIL", project)
+            else:
+                logging.info("%s: SUCCESS", project)
+
+        num_projects -= 1
 
 
 if __name__ == '__main__':
